@@ -1,0 +1,13 @@
+[package]
+name = "thruster-test"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.68"
+redis ={ version= "0.23.0", features = ["tokio-comp"] }
+thruster = { version = "1.3.2", features = ["hyper_server", "thruster-jab"] }
+thruster-jab = "0.1.0"
+tokio = { version = "1.28.1", features = ["full"] }
