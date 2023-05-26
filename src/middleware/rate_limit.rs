@@ -1,17 +1,16 @@
-use crate::RequestStateGetField;
 use async_trait::async_trait;
-use redis::{aio::Connection, AsyncCommands, RedisError, RedisResult};
-use std::{fmt::Debug, sync::Arc};
+use redis::{aio::ConnectionManager, AsyncCommands, RedisError, RedisResult};
+use std::fmt::Debug;
 use thruster::{
     context::typed_hyper_context::TypedHyperContext, errors::ThrusterError, middleware_fn, Context,
-    MiddlewareNext, MiddlewareResult,
+    ContextState, MiddlewareNext, MiddlewareResult,
 };
-use tokio::sync::Mutex;
 
-pub struct RateLimiter<T: Store> {
+#[derive(Clone)]
+pub struct RateLimiter<T: Store + Clone + Sync> {
     pub max: usize,
-    pub per_ms: usize,
-    pub store: Arc<Mutex<T>>,
+    pub per_s: usize,
+    pub store: T,
 }
 
 #[async_trait]
@@ -21,16 +20,17 @@ pub trait Store {
     async fn set(&mut self, key: &str, value: usize, expiry_ms: usize) -> Result<(), Self::Error>;
 }
 
+#[derive(Clone)]
 pub struct RedisStore {
-    url: String,
-    connection: Connection,
+    connection_manager: ConnectionManager,
 }
 
 impl RedisStore {
-    pub async fn new(url: String) -> RedisResult<Self> {
-        let client = redis::Client::open(url.as_str())?;
-        let connection = client.get_async_connection().await?;
-        return Ok(Self { connection, url });
+    pub async fn new(url: &str) -> RedisResult<Self> {
+        let client = redis::Client::open(url)?;
+        let connection_manager = ConnectionManager::new(client).await?;
+
+        return Ok(Self { connection_manager });
     }
 }
 
@@ -39,31 +39,26 @@ impl Store for RedisStore {
     type Error = RedisError;
 
     async fn get(&mut self, key: &str) -> Result<Option<usize>, Self::Error> {
-        let current: Option<usize> = self.connection.get(key).await?;
+        let current: Option<usize> = self.connection_manager.get(key).await?;
         return Ok(current);
     }
 
-    async fn set(&mut self, key: &str, value: usize, expiry_ms: usize) -> Result<(), Self::Error> {
-        let _: () = self.connection.set_ex(key, value, expiry_ms).await?;
+    async fn set(&mut self, key: &str, value: usize, expiry_s: usize) -> Result<(), Self::Error> {
+        let _: () = self.connection_manager.set_ex(key, value, expiry_s).await?;
         return Ok(());
     }
 }
 
-// RequestStateGetField<RateLimiter<G>> needed
 #[middleware_fn]
 pub async fn rate_limit_middleware<
-    T: Send + RequestStateGetField<RateLimiter<G>>,
-    G: 'static + Store + Send + Sync,
+    T: Send + ContextState<RateLimiter<G>>,
+    G: 'static + Store + Send + Sync + Clone,
 >(
     mut context: TypedHyperContext<T>,
     next: MiddlewareNext<TypedHyperContext<T>>,
 ) -> MiddlewareResult<TypedHyperContext<T>> {
-    let rate_limiter: &RateLimiter<G> = context.extra.get();
-
-    let RateLimiter { store, max, per_ms } = rate_limiter;
-
-    let store = Arc::clone(&store);
-    let mut store = store.lock().await;
+    let rate_limiter: &mut RateLimiter<G> = context.extra.get_mut();
+    let RateLimiter { store, max, per_s } = rate_limiter;
 
     let key = "rate_limit:".to_string()
         + &context
@@ -88,7 +83,7 @@ pub async fn rate_limit_middleware<
         });
     }
 
-    let _: () = store.set(&key, new_count, *per_ms).await.unwrap();
+    let _: () = store.set(&key, new_count, *per_s).await.unwrap();
 
     return next(context).await;
 }

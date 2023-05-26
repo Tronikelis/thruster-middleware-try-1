@@ -1,33 +1,25 @@
 #![allow(clippy::needless_return)]
 
-use std::sync::Arc;
 use thruster::{
     context::typed_hyper_context::TypedHyperContext, context_state, m, middleware_fn, App,
     HyperRequest, HyperServer, MiddlewareNext, MiddlewareResult, ThrusterServer,
 };
-use thruster_jab::JabDI;
-use tokio::sync::Mutex;
 
 mod middleware;
 use middleware::rate_limit::{rate_limit_middleware, RateLimiter, RedisStore};
 
 type Context = TypedHyperContext<RequestState>;
 
-context_state!(RequestState => [Arc<JabDI>, RateLimiter<RedisStore>]);
+#[context_state]
+struct RequestState(RateLimiter<RedisStore>);
 
-struct ServerState {
-    jab: Arc<JabDI>,
-    rate_limiter_store: Arc<Mutex<RedisStore>>,
+struct ServerConfig {
+    rate_limiter: RateLimiter<RedisStore>,
 }
 
-fn init_context(request: HyperRequest, state: &ServerState, _path: &str) -> Context {
-    let rate_limiter = RateLimiter {
-        max: 10,
-        per_ms: 10_000,
-        store: state.rate_limiter_store.clone(),
-    };
-
-    return Context::new(request, (Arc::clone(&state.jab), rate_limiter));
+fn init_context(request: HyperRequest, state: &ServerConfig, _path: &str) -> Context {
+    let ServerConfig { rate_limiter } = state;
+    return Context::new(request, RequestState(rate_limiter.clone()));
 }
 
 #[middleware_fn]
@@ -39,18 +31,15 @@ async fn root(mut context: Context, _next: MiddlewareNext<Context>) -> Middlewar
 
 #[tokio::main]
 async fn main() {
-    let rate_limiter_store = Arc::new(Mutex::new(
-        RedisStore::new("redis://127.0.0.1".to_string())
-            .await
-            .unwrap(),
-    ));
+    let rate_limiter = RateLimiter {
+        max: 100,
+        per_s: 60,
+        store: RedisStore::new("redis://127.0.0.1").await.unwrap(),
+    };
 
-    let app = App::<HyperRequest, Context, ServerState>::create(
+    let app = App::<HyperRequest, Context, ServerConfig>::create(
         init_context,
-        ServerState {
-            jab: Arc::new(JabDI::default()),
-            rate_limiter_store,
-        },
+        ServerConfig { rate_limiter },
     )
     .middleware("/", m![rate_limit_middleware])
     .get("/", m![root]);
